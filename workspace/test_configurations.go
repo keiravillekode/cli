@@ -140,6 +140,9 @@ var TestConfigurations = map[string]TestConfiguration{
 	"erlang": {
 		Command: "rebar3 eunit",
 	},
+	"factor": {
+		Command: "factor -roots=. -run=tools.test {{slug}}",
+	},
 	"fortran": {
 		Command: "make",
 	},
