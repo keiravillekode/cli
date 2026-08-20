@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/exercism/cli/api"
 	"github.com/exercism/cli/config"
@@ -20,6 +22,18 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
+
+const (
+	// maxDownloadAttempts is how many times a single file is requested before giving up.
+	maxDownloadAttempts = 3
+	// maxRetryDelay is the longest we are willing to wait between attempts.
+	maxRetryDelay = 60 * time.Second
+	// defaultRetryDelay is used when the server doesn't say how long to wait.
+	defaultRetryDelay = 5 * time.Second
+)
+
+// retrySleep is a variable so that tests don't have to wait for real backoff.
+var retrySleep = time.Sleep
 
 // downloadCmd represents the download command
 var downloadCmd = &cobra.Command{
@@ -81,46 +95,98 @@ func runDownload(cfg config.Config, flags *pflag.FlagSet, args []string) error {
 	}
 
 	for _, sf := range download.payload.files() {
-		url, err := sf.url()
-		if err != nil {
-			return err
-		}
-
-		req, err := client.NewRequest("GET", url, nil)
-		if err != nil {
-			return err
-		}
-
-		res, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode != http.StatusOK {
-			// TODO: deal with it
-			continue
-		}
-
-		path := sf.relativePath()
-		dir := filepath.Join(metadata.Dir, filepath.Dir(path))
-		if err = os.MkdirAll(dir, os.FileMode(0755)); err != nil {
-			return err
-		}
-
-		f, err := os.Create(filepath.Join(metadata.Dir, path))
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = io.Copy(f, res.Body)
-		if err != nil {
-			return err
+		if err := downloadFile(client, sf, metadata.Dir); err != nil {
+			return fmt.Errorf("failed to download '%s': %s", sf.path, err)
 		}
 	}
 	fmt.Fprintf(Err, "\nDownloaded to\n")
 	fmt.Fprintf(Out, "%s\n", metadata.Dir)
 	return nil
+}
+
+// downloadFile fetches a single solution file and writes it into the exercise
+// directory. A file that cannot be fetched in full is an error: leaving a
+// truncated or empty file behind would look like a successful download.
+func downloadFile(client *api.Client, sf solutionFile, exerciseDir string) error {
+	url, err := sf.url()
+	if err != nil {
+		return err
+	}
+
+	res, err := requestFile(client, url)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	path := sf.relativePath()
+	if err := os.MkdirAll(filepath.Join(exerciseDir, filepath.Dir(path)), os.FileMode(0755)); err != nil {
+		return err
+	}
+
+	filename := filepath.Join(exerciseDir, path)
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, res.Body); err != nil {
+		// Don't leave a half-written file lying around.
+		f.Close()
+		os.Remove(filename)
+		return err
+	}
+	return nil
+}
+
+// requestFile requests a single solution file, retrying when the API asks us
+// to back off. On success the response body is left open for the caller.
+func requestFile(client *api.Client, url string) (*http.Response, error) {
+	for attempt := 1; ; attempt++ {
+		req, err := client.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		res, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode >= 200 && res.StatusCode <= 299 {
+			return res, nil
+		}
+
+		delay, retryable := retryDelay(res, attempt)
+		if !retryable || attempt == maxDownloadAttempts || delay > maxRetryDelay {
+			err := decodedAPIError(res)
+			res.Body.Close()
+			return nil, err
+		}
+		res.Body.Close()
+
+		fmt.Fprintf(Err, "The server asked us to slow down; retrying in %s\n", delay)
+		retrySleep(delay)
+	}
+}
+
+// retryDelay reports how long to wait before retrying a failed request, and
+// whether retrying is worth it at all. It honors the Retry-After header, which
+// may hold either a delay in seconds or an HTTP date.
+func retryDelay(res *http.Response, attempt int) (time.Duration, bool) {
+	if res.StatusCode != http.StatusTooManyRequests && res.StatusCode != http.StatusServiceUnavailable {
+		return 0, false
+	}
+
+	retryAfter := res.Header.Get("Retry-After")
+	if seconds, err := strconv.Atoi(retryAfter); err == nil {
+		return max(time.Duration(seconds)*time.Second, 0), true
+	}
+	if date, err := http.ParseTime(retryAfter); err == nil {
+		return max(time.Until(date), 0), true
+	}
+	// No usable Retry-After header, so back off on our own schedule.
+	return time.Duration(attempt) * defaultRetryDelay, true
 }
 
 type download struct {

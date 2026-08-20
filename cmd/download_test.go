@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/exercism/cli/config"
 	"github.com/exercism/cli/workspace"
@@ -419,3 +420,197 @@ const payloadTemplate = `
 	}
 }
 `
+
+func TestDownloadRetriesRateLimitedFiles(t *testing.T) {
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
+	var delays []time.Duration
+	oldSleep := retrySleep
+	retrySleep = func(d time.Duration) { delays = append(delays, d) }
+	defer func() { retrySleep = oldSleep }()
+
+	// Rate limit every file once, then serve it.
+	rateLimited := map[string]bool{}
+	ts := fakeDownloadServerWithFileHandler(func(w http.ResponseWriter, r *http.Request, body string) bool {
+		if rateLimited[r.URL.Path] {
+			return false
+		}
+		rateLimited[r.URL.Path] = true
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, "Retry later")
+		return true
+	})
+	defer ts.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download-cmd")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	err = runDownload(downloadConfig(tmpDir, ts.URL), downloadFlags(map[string]string{"uuid": "bogus-id"}), []string{})
+	assert.NoError(t, err)
+
+	assertDownloadedCorrectFiles(t, tmpDir)
+	assert.Equal(t, []time.Duration{2 * time.Second, 2 * time.Second, 2 * time.Second}, delays)
+}
+
+func TestDownloadFailsWhenPersistentlyRateLimited(t *testing.T) {
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
+	oldSleep := retrySleep
+	retrySleep = func(time.Duration) {}
+	defer func() { retrySleep = oldSleep }()
+
+	var requests int
+	ts := fakeDownloadServerWithFileHandler(func(w http.ResponseWriter, r *http.Request, body string) bool {
+		requests++
+		w.Header().Set("Retry-After", "23")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, "Retry later")
+		return true
+	})
+	defer ts.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download-cmd")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	err = runDownload(downloadConfig(tmpDir, ts.URL), downloadFlags(map[string]string{"uuid": "bogus-id"}), []string{})
+	if assert.Error(t, err) {
+		assert.Regexp(t, "failed to download 'file-1.txt'", err.Error())
+		assert.Regexp(t, "please try again after 23 seconds", err.Error())
+	}
+	assert.Equal(t, maxDownloadAttempts, requests)
+
+	// A rate limited download must not leave an empty file behind.
+	_, err = os.Lstat(filepath.Join(tmpDir, "bogus-track", "bogus-exercise", "file-1.txt"))
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestDownloadFailsOnMissingFile(t *testing.T) {
+	co := newCapturedOutput()
+	co.override()
+	defer co.reset()
+
+	ts := fakeDownloadServerWithFileHandler(func(w http.ResponseWriter, r *http.Request, body string) bool {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, "Not found")
+		return true
+	})
+	defer ts.Close()
+
+	tmpDir, err := os.MkdirTemp("", "download-cmd")
+	defer os.RemoveAll(tmpDir)
+	assert.NoError(t, err)
+
+	err = runDownload(downloadConfig(tmpDir, ts.URL), downloadFlags(map[string]string{"uuid": "bogus-id"}), []string{})
+	if assert.Error(t, err) {
+		assert.Regexp(t, "failed to download 'file-1.txt'", err.Error())
+		assert.Regexp(t, "404 Not Found", err.Error())
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	testCases := []struct {
+		name          string
+		status        int
+		retryAfter    string
+		attempt       int
+		expectedDelay time.Duration
+		retryable     bool
+	}{
+		{
+			name:          "rate limited with delay seconds",
+			status:        http.StatusTooManyRequests,
+			retryAfter:    "23",
+			attempt:       1,
+			expectedDelay: 23 * time.Second,
+			retryable:     true,
+		},
+		{
+			name:          "rate limited without a Retry-After header backs off",
+			status:        http.StatusTooManyRequests,
+			attempt:       2,
+			expectedDelay: 2 * defaultRetryDelay,
+			retryable:     true,
+		},
+		{
+			name:          "a Retry-After date in the past means retry now",
+			status:        http.StatusServiceUnavailable,
+			retryAfter:    "Mon, 02 Jan 2006 15:04:05 GMT",
+			attempt:       1,
+			expectedDelay: 0,
+			retryable:     true,
+		},
+		{
+			name:      "other errors are not retryable",
+			status:    http.StatusNotFound,
+			attempt:   1,
+			retryable: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &http.Response{StatusCode: tc.status, Header: make(http.Header)}
+			if tc.retryAfter != "" {
+				res.Header.Set("Retry-After", tc.retryAfter)
+			}
+
+			delay, retryable := retryDelay(res, tc.attempt)
+			assert.Equal(t, tc.retryable, retryable)
+			if tc.retryable {
+				assert.Equal(t, tc.expectedDelay, delay)
+			}
+		})
+	}
+}
+
+func downloadConfig(workspaceDir, baseURL string) config.Config {
+	v := viper.New()
+	v.Set("workspace", workspaceDir)
+	v.Set("apibaseurl", baseURL)
+	v.Set("token", "abc123")
+	return config.Config{UserViperConfig: v}
+}
+
+func downloadFlags(values map[string]string) *pflag.FlagSet {
+	flags := pflag.NewFlagSet("fake", pflag.PanicOnError)
+	setupDownloadFlags(flags)
+	for name, value := range values {
+		flags.Set(name, value)
+	}
+	return flags
+}
+
+// fakeDownloadServerWithFileHandler serves the same solution as
+// fakeDownloadServer, but lets a test intercept the individual file requests.
+// The interceptor returns true when it has handled the response itself.
+func fakeDownloadServerWithFileHandler(handler func(w http.ResponseWriter, r *http.Request, body string) bool) *httptest.Server {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+
+	files := map[string]string{
+		"/file-1.txt":        "this is file 1",
+		"/subdir/file-2.txt": "this is file 2",
+		"/file-3.txt":        "",
+	}
+	for path, body := range files {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			if handler(w, r, body) {
+				return
+			}
+			fmt.Fprint(w, body)
+		})
+	}
+
+	mux.HandleFunc("/solutions/bogus-id", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, payloadTemplate, "true", server.URL+"/")
+	})
+
+	return server
+}
