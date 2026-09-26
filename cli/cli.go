@@ -39,10 +39,12 @@ var (
 	}
 
 	archMap = map[string]string{
-		"386":   "i386",
-		"amd64": "x86_64",
-		"arm":   "arm",
-		"ppc64": "ppc64",
+		"386":     "i386",
+		"amd64":   "x86_64",
+		"arm":     "arm",
+		"arm64":   "arm64",
+		"ppc64":   "ppc64",
+		"riscv64": "riscv64",
 	}
 )
 
